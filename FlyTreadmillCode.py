@@ -1,4 +1,4 @@
-#Read the Optical mouse value via SPI
+
 #   Pin layout
 # RasPi  | ADNS3080
 #  3V3   |   3.3V
@@ -9,6 +9,29 @@
 # SPICE0 |   NCS
 # GPIO25 |   RST
 
+# RasPi  | DVR8833 | Motor | Power | Condenser (100uF)
+# GPIO17 |   DIR   |       |       |
+# GPIO27 |   STEP  |       |       |
+# GPIO22 |   SLP   |       |       |
+# GPIO23 |   M1    |       |       |
+# GPIO24 |   M0    |       |       |
+#  GND   |   GND   |       |       |
+#        |   A1    | Blacl |       |
+#        |   A2    | Green |       |
+#        |   B1    | Red   |       |
+#        |   A2    | Blue  |       |
+#        |   VMOT  |       |   +   |      +
+#        |   GND   |       |  GND  |      -
+
+# Microstep Resolution  |   M0   |  M1
+#         Full          |  LOW   | HIGH
+#         Half          |  HIGH  | LOW
+#         1/4           |Floating| LOW
+#         1/8           |  LOW   | HIGH
+#         1/16          |  HIGH  | HIGH
+#         1/32          |Floating| HIGH
+# *Leaving selection pins disconnected results "Floating".
+
 import pigpio
 import time
 import numpy
@@ -16,7 +39,7 @@ import PIL.Image, PIL.ImageTk
 from Tkinter import *
 from threading import Timer
 
-
+##### Set parameters for ADNS3080 #####
 RESET_PIN = 25                                   #GPIO25 for reset ADNS3080
 SPI_CHANNEL = 0                                  # GPIO8(CE0) if choose CE1, set 1
 SPI_MODE = 3                                     #SPI mode as two bit pattern of clock polarity and phase
@@ -36,6 +59,47 @@ ADNS3080_PIXELS_X = 30
 ADNS3080_PIXELS_Y = 30
 
 DATA_FOR_CAPTURE_IMAGE = [0xff,ADNS3080_FRAME_CAPTURE]*899 + [0xff]     # make [0xff (dummy 1), Address, 0xff (2), Address, ..., Adreess, 0xff (900)]
+##### End defines of ADNS3080 parameters#####
+
+##### Set parameters for Stepping motor control #####
+MOTOR_STEP_PIN = 27                # GPIO27: STEP command
+MOTOR_DIR_PIN = 17                 # GPIO17: Direction CW:HIGH  CCW:LOW
+MOTOR_SLEEP_PIN = 22               # GPIO22: Sleep mode
+MOTOR_M0_PIN = 24
+MOTOR_M1_PIN = 23
+MOTOR_STEP_ANGLE = 1.8             # Motor full step angle: 1.8 deg./step
+MOTOR_SPEED_LIMIT = 5              # [rps] Stepping Motor limit is 5 rps.
+MOTOR_STEPRESMODES_DICT = {1: (0,0), 2: (1,0), 4: (0,0), 8: (0,1), 16: (1,1), 32: (0,1)} # Resolution: (M0 pin, M1 pin)
+
+motor_step_resolution = 1
+
+SCREW_STANDARD = 'M5'
+SCREW_LEAD = 0.8                   # [mm] Lead = pitch
+
+SYRINGE_AREA = 165.13              # [mm^2]
+
+AVAIRABLE_PWM_FREQ_DICT = { 1: (50,100,200,250,400,500,800,1000,1250,1600,2000,2500,4000,5000,8000,10000,20000,40000), # Sample rate [us]: (Hertz)
+                            2: (25, 50,100,125,200,250,400, 500, 625, 800,1000,1250,2000,2500,4000, 5000,10000,20000),
+                            4: (13, 25, 50, 63,100,125,200, 250, 313, 400, 500, 625,1000,1250,2000, 2500, 5000,10000),
+                            5: (10, 20, 40, 50, 80,100,160, 200, 250, 320, 400, 500, 800,1000,1600, 2000, 4000, 8000),
+                            8: ( 6, 13, 25, 31, 50, 63,100, 125, 156, 200, 250, 313, 500, 625,1000, 1250, 2500, 5000),
+                           10: ( 5, 10, 20, 25, 40, 50, 80, 100, 125, 160, 200, 250, 400, 500, 800, 1000, 2000, 4000)}
+
+PWM_DUTYCYCLE = (0, 128)           # PWM (STOP, 1/2 on)
+PWM_SAMPLE_RATE = 5                # Default is 5 us. If you want to change sample rate, type "sudo pigpiod -s <sample rate>" in comand line, when you start the pigpio deamon. 
+
+
+AVAIRABLE_FLOW_RATE_DICT = {}      # {Flow rate [ml/s]: PWM frequency [Hz]}
+for freq in range(len(AVAIRABLE_PWM_FREQ_DICT[PWM_SAMPLE_RATE])):
+    RPM = (MOTOR_STEP_ANGLE / motor_step_resolution * AVAIRABLE_PWM_FREQ_DICT[PWM_SAMPLE_RATE][freq]) / 360  # [rotation / sec]
+    flow_rate = RPM * SCREW_LEAD * SYRINGE_AREA * 10**-3 # [ml / sec]
+    if RPM <= MOTOR_SPEED_LIMIT:
+        AVAIRABLE_FLOW_RATE_DICT[flow_rate] = AVAIRABLE_PWM_FREQ_DICT[PWM_SAMPLE_RATE][freq]
+    else:
+        thing = None               # do nothing
+##### End defines of Stepping motor control parameters#####
+
+
 
 class GUI():
     grid_size = 10
@@ -44,6 +108,9 @@ class GUI():
     position_Y = 0
     capture_image = True
     position_gap = (grid_size*ADNS3080_PIXELS_X) / 2
+
+    motor_direction = 1                # direcion = 0 (CCW) or 1 (CW)
+    motor_moving_dulation = 1          # [sec]
 
     def __init__(self, master):
         master.title("ADNS3080 Capture Image")        # set main window's title
@@ -80,9 +147,22 @@ class GUI():
         self.Plotlabel.place(x=self.grid_size*ADNS3080_PIXELS_X,y=0)
         self.PlotStatus.set("Move tracking mode: OFF")
 
-        
+        self.button_Motor = Button(master, text="MOTOR START", width = 15, command = lambda : self.moveSteppingMotor(self.motor_direction,self.motor_moving_dulation))   # command fnc is nomally called without argument. That is why use lambda.
+        #self.button_Motor.bind("<Button-1>",self.moveSteppingMotor(self.motor_direction,self.motor_moving_dulation))
+        self.button_Motor.place(x=0,y=self.grid_size*ADNS3080_PIXELS_Y+self.grid_size*5)
 
         self.read_loop()                              # start attempts to read image from ADNS3080 via SPI
+
+    def moveSteppingMotor(self,direc,dulat):
+        try:
+            #self.timer.cancel()
+            pi.write(MOTOR_DIR_PIN,direc)
+            pi.set_PWM_dutycycle(MOTOR_STEP_PIN, PWM_DUTYCYCLE[1])  # PWM on
+            time.sleep(dulat)
+            pi.set_PWM_dutycycle(MOTOR_STEP_PIN, PWM_DUTYCYCLE[0])  # PWM off
+            print("debug")
+        except:
+            thing = None
 
     def plotData(self):
         self.canvas_for_Plot.delete(self.old_data)
@@ -231,11 +311,47 @@ def spiWrite(reg,data):
 #end def spiWrite()
 
 
-## Settings ##
+def motorSettings(stepResolution):
+    global pi, motor_step_resolution
+    pi.set_mode(MOTOR_STEP_PIN,pigpio.OUTPUT)
+    pi.set_mode(MOTOR_DIR_PIN,pigpio.OUTPUT)
+    pi.set_mode(MOTOR_SLEEP_PIN,pigpio.OUTPUT)
+    pi.set_mode(MOTOR_M0_PIN,pigpio.OUTPUT)
+    pi.set_mode(MOTOR_M1_PIN,pigpio.OUTPUT)
+
+    pi.write(MOTOR_SLEEP_PIN,1)
+    time.sleep(1e-3)               # Wake-up time. Need to set over 1msec
+
+    if stepResolution in MOTOR_STEPRESMODES_DICT:
+        pi.write(MOTOR_M0_PIN,MOTOR_STEPRESMODES_DICT[stepResolution][0])
+        pi.write(MOTOR_M1_PIN,MOTOR_STEPRESMODES_DICT[stepResolution][1])
+    else:
+        motor_step_resolution = 1  # Set step resolution to Full-step mode
+        pi.write(MOTOR_M0_PIN,0)
+        pi.write(MOTOR_M1_PIN,0)
+        print("Invalid value. Step resolution should be within the following values.")
+        print("Full > 1, Half > 2, 1/4 > 4, 1/8 > 8, 1/16 > 16, 1/32 > 32")
+        print("Step resolution is now Full-step (default).")
+
+    if stepResolution == 4 or stepResolution == 32:
+        print("Please disconnect M0 pin: GPIO" '%d' %MOTOR_M0_PIN)
+#end def motorSettings()
+
+def motorFreqSetting():
+    pi.set_PWM_frequency(MOTOR_STEP_PIN, AVAIRABLE_PWM_FREQ_DICT[PWM_SAMPLE_RATE][12])
+    pi.set_PWM_dutycycle(MOTOR_STEP_PIN, PWM_DUTYCYCLE[0])
+#end def motorFreqSetting()
+
+
+## ADNS3080 Settings ##
 spiSettings(SPI_CHANNEL,SPI_MAX_SPEED,SPI_MODE)
 resetADNS3080()
 checkConnect()
 configuration()
+
+## Motor Settings ##
+motorSettings(motor_step_resolution)
+motorFreqSetting()
 
 ## main loop ##
 root = Tk()
@@ -249,5 +365,6 @@ root.mainloop()
 gui.endProgram()
 
 pi.spi_close(spi)
+pi.write(MOTOR_SLEEP_PIN,0)
 
 print("existing")
