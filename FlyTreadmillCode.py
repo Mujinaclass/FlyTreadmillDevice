@@ -37,7 +37,7 @@ import time
 import numpy
 import PIL.Image, PIL.ImageTk
 from Tkinter import *
-from threading import Timer
+import threading
 
 ##### Set parameters for ADNS3080 #####
 RESET_PIN = 25                                   #GPIO25 for reset ADNS3080
@@ -147,22 +147,28 @@ class GUI():
         self.Plotlabel.place(x=self.grid_size*ADNS3080_PIXELS_X,y=0)
         self.PlotStatus.set("Move tracking mode: OFF")
 
-        self.button_Motor = Button(master, text="MOTOR START", width = 15, command = lambda : self.moveSteppingMotor(self.motor_direction,self.motor_moving_dulation))   # command fnc is nomally called without argument. That is why use lambda.
-        #self.button_Motor.bind("<Button-1>",self.moveSteppingMotor(self.motor_direction,self.motor_moving_dulation))
+        self.button_Motor = Button(master, text="MOTOR START", width = 15, command = self.eventPushMoveMotorButton)
         self.button_Motor.place(x=0,y=self.grid_size*ADNS3080_PIXELS_Y+self.grid_size*5)
 
-        self.read_loop()                              # start attempts to read image from ADNS3080 via SPI
+        self.event = threading.Event()
+        self.t1 = threading.Thread(name='readLoop',target=self.read_loop).start()    # start attempts to read image from ADNS3080 via SPI
+        self.t2 = threading.Thread(name='moveMotor',target=self.moveSteppingMotor,args=(self.motor_direction,self.motor_moving_dulation)).start()
 
+    def eventPushMoveMotorButton(self):
+        self.event.set()
+    
     def moveSteppingMotor(self,direc,dulat):
-        try:
-            #self.timer.cancel()
-            pi.write(MOTOR_DIR_PIN,direc)
-            pi.set_PWM_dutycycle(MOTOR_STEP_PIN, PWM_DUTYCYCLE[1])  # PWM on
-            time.sleep(dulat)
-            pi.set_PWM_dutycycle(MOTOR_STEP_PIN, PWM_DUTYCYCLE[0])  # PWM off
-            print("debug")
-        except:
-            thing = None
+        self.event.wait()
+        self.event.clear()
+        
+        pi.write(MOTOR_DIR_PIN,direc)
+        pi.set_PWM_dutycycle(MOTOR_STEP_PIN, PWM_DUTYCYCLE[1])  # PWM on
+        time.sleep(dulat)
+        pi.set_PWM_dutycycle(MOTOR_STEP_PIN, PWM_DUTYCYCLE[0])  # PWM off
+
+        self.timer2 = threading.Timer(0.0, self.moveSteppingMotor,args=(self.motor_direction,self.motor_moving_dulation))
+        self.timer2.start()
+        
 
     def plotData(self):
         self.canvas_for_Plot.delete(self.old_data)
@@ -218,7 +224,7 @@ class GUI():
             else:
                 self.updateDxDy()
 
-            self.timer = Timer(0.0, self.read_loop)
+            self.timer = threading.Timer(0.0, self.read_loop)
             self.timer.start()
         else:
             thing = None # do nothing
